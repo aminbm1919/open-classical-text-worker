@@ -93,6 +93,25 @@ export default {
         return json({ ok: true });
       }
 
+      // LIVENESS: manual/demo (marker HQ) — public portfolio demo. Perimeter-EXEMPT by design:
+      // protected instead by the demo_enabled kill flag (default OFF) + its own D1 budget guard.
+      // Read-only, whitelisted public-domain sources, zero Workers AI, zero memory access.
+      if (route === "/demo" || route === "/demo-search") {
+        return handleDemoRoutes(route, request, url, env);
+      }
+
+      // LIVENESS: perimeter gate for ALL routes (marker HP). Dark until the
+      // ROUTINE_TOKEN secret is set; once set, every request must carry either
+      // the routine key or a valid admin token (single key per caller).
+      if (!isRoutineRequestAllowed(request, url, env)) {
+        return json({
+          ok: false,
+          error: "This worker requires an access token.",
+          error_code: "unauthorized",
+          remedy: "Send the routine key in the X-Routine-Token header (configure API-Key auth with that custom header name on the GPT action), or supply a valid X-Admin-Token."
+        }, 401);
+      }
+
       // LIVENESS: routine-action (getWorkerInfo) - open
       if (route === "/") {
         return json({
@@ -2418,6 +2437,26 @@ function constantTimeEqual(a, b) {
   }
 
   return result === 0;
+}
+
+/**
+ * MACHINE (auth gate): Perimeter check for EVERY fetch route (marker HP). INPUT: `request`,`url`,`env` — reads `X-Routine-Token` header or `?routine_token=`. OUTPUT: boolean. Rules: if the `ROUTINE_TOKEN` secret is unset the gate is OPEN (dark deploy, byte-identical behavior to pre-HP); otherwise the supplied routine token must match via `constantTimeEqual`, or the request must carry a valid admin token (`isAdminRequest`) so admin callers never need two keys. Purpose: the routine GPT action is deliberately token-light, but the worker URL is reconstructable from public identity (workers.dev subdomain + script name in the public portfolio repo), so the perimeter — not obscurity — protects free-plan quota and open-write memory.
+ */
+function isRoutineRequestAllowed(request, url, env) {
+  if (!env.ROUTINE_TOKEN) {
+    return true;
+  }
+
+  const supplied =
+    request.headers.get("X-Routine-Token") ||
+    url.searchParams.get("routine_token") ||
+    "";
+
+  if (supplied && constantTimeEqual(String(supplied), String(env.ROUTINE_TOKEN))) {
+    return true;
+  }
+
+  return isAdminRequest(request, url, env).ok === true;
 }
 
 /**
@@ -24399,10 +24438,13 @@ async function classifyQueryTopics(env, query) {
 // Query the Neon corpus: classify topics (CF llama) -> query the relevant projects' corpus_vectors by
 // cosine on the halfvec HNSW index -> return matches in the SAME shape as queryVectorizeIndexForProbe so
 // resolveVectorMatchToSegment + RRF + dedup work UNCHANGED. SOFT-FAIL (never throws) like the CF probe.
-async function queryNeonCorpusForProbe(env, query, queryVector, topK) {
+async function queryNeonCorpusForProbe(env, query, queryVector, topK, fixedProjectKeys = null) {
   try {
     if (!Array.isArray(queryVector) || queryVector.length !== QDRANT_EMBED_DIM) return { ok: false, status: "query_vector_invalid", matches: [] };
-    const topics = await classifyQueryTopics(env, query);
+    // HQ (demo): when the caller supplies a FIXED project list, skip the CF-llama topic router entirely
+    // (the demo runs with zero Workers AI). Absent/empty -> original router behavior, byte-identical.
+    const useFixedProjects = Array.isArray(fixedProjectKeys) && fixedProjectKeys.length > 0;
+    const topics = useFixedProjects ? [] : await classifyQueryTopics(env, query);
     // CW: empty-topic fallback. The small CF router occasionally returns no parseable topic for a query
     // (seen on some terse non-English terms); without this that query gets ZERO vector recall. Instead of
     // returning nothing, probe the PRIMARY project of every topic (one per pair) so the vector branch still
@@ -24410,13 +24452,15 @@ async function queryNeonCorpusForProbe(env, query, queryVector, topK) {
     // queries are unaffected. status flags the fallback for observability.
     const projectKeys = [];
     let fallbackUsed = false;
-    if (topics.length) {
+    if (useFixedProjects) {
+      for (const p of fixedProjectKeys) if (p && !projectKeys.includes(p)) projectKeys.push(p);
+    } else if (topics.length) {
       for (const t of topics) { const pair = NEON_TOPIC_PROJECTS[Number(t)]; if (pair) for (const p of pair) if (!projectKeys.includes(p)) projectKeys.push(p); }
     } else {
       fallbackUsed = true;
       for (const t of Object.keys(NEON_TOPIC_PROJECTS)) { const pair = NEON_TOPIC_PROJECTS[Number(t)]; if (pair && pair[0] && !projectKeys.includes(pair[0])) projectKeys.push(pair[0]); }
     }
-    const capped = projectKeys.slice(0, fallbackUsed ? 5 : 4); // bound subrequests: <=5 on fallback (one per topic), else <=4
+    const capped = projectKeys.slice(0, (fallbackUsed || useFixedProjects) ? 5 : 4); // bound subrequests: <=5 on fixed/fallback (one per topic), else <=4
     const literal = formatHalfvecLiteral(queryVector);
     const perProject = Math.max(1, Math.min(Number(topK) || 5, 10));
     const all = [];
@@ -24514,7 +24558,8 @@ async function runHybridVectorBranchForIndex(env, query, indexKey, resolvedChunk
     // Returns the same match shape, so the resolve/RRF/dedup below are unchanged. Default = CF Vectorize.
     const useNeonCorpus = indexKey === "m3_cache" && String(await getStoragePolicyValue(env, "corpus_vector_backend", "vectorize")).toLowerCase() === "neon";
     const queried = useNeonCorpus
-      ? await queryNeonCorpusForProbe(env, query, embedded.vector, topK)
+      ? await queryNeonCorpusForProbe(env, query, embedded.vector, topK,
+          Array.isArray(options.demo_fixed_neon_projects) && options.demo_fixed_neon_projects.length ? options.demo_fixed_neon_projects : null)
       : await queryVectorizeIndexForHybrid(env, context || makeHybridQueryContext(), policy, embedded.vector, topK);
     if (!queried.ok) {
       return { ok: false, status: queried.status || "vector_query_failed", results: [], report: { ...report, status: queried.status || "vector_query_failed", error: queried.error || null, first_error: queried.first_error || null, vector_queries: 0, embedding_calls: report.embedding_calls } };
@@ -36684,3 +36729,465 @@ function normalizeLexicalText(text) {
 // END_OF_WORKER_V2_9_40_C_6_HN_FILE_MAP_TOC_PLUS_FIVE_SUBSYSTEM_BANNERS_COMMENTS_ONLY_ENTRYPOINTS_CRON_MEMORY_ARTICLE_ADAPTERS_RESPONSE_CONTRACT_ANCHOR_GREP_LIST_FOR_NON_CONTIGUOUS_SUBSYSTEMS
 
 // END_OF_WORKER_V2_9_40_C_6_HO_MACHINE_GEAR_HEADER_SWEEP_COMPLETE_8_OF_859_FUNCTIONS_WERE_MISSING_IPO_HEADERS_RESOLVECOREPARSETARGET_COLLAPSECROSSSOURCEWORKS_SOFTSUSPICION_HELPERS_BUILDDOCUMENTCACHEIDENTITY_HANDLER2TEXTBACKFILL_REFRESH_FLAG_HELPERS_ALL_COMMENTED_PLUS_WIRE_CONTRACT_MD_AND_TOOLS_WIRE_CHECK_PY_CONTRACT_GUARD_AND_DOCS_INDEX_MD_AND_FLAGS_MD_AND_ROUTES_MD_DOC_SET
+
+// =============================================================================
+// ===== [16] PUBLIC PORTFOLIO DEMO (marker HQ) — /demo + /demo-search
+// A perimeter-exempt, read-only showcase of the hybrid retrieval engine. Deliberate constraints:
+//   - ZERO Workers AI: query embedding = NVIDIA NIM bge-m3 -> HF bge-m3 fallback (same 1024-dim
+//     space as the corpus); NO CF-llama topic router (fixed Neon project list instead).
+//   - ZERO memory access, ZERO writes to research state; sources whitelisted to public-domain archives.
+//   - Own budget guard (per-IP hourly + global daily, D1 buckets) + demo_enabled kill flag (default OFF).
+//   - Canonical-query caches: query-vector cache + full-response cache, so repeat/sample queries
+//     cost zero upstream calls and zero budget.
+// =============================================================================
+
+const DEMO_SOURCES = ["marxists", "gutenberg", "wikisource"];
+const DEMO_REPO_URL = "https://github.com/aminbm1919/open-classical-text-worker";
+const DEMO_CASE_STUDY_URL = DEMO_REPO_URL + "/blob/main/docs/CASE_STUDY.md";
+
+// Single-file demo UI. NOTE: the page's own JS is written WITHOUT template literals so this
+// backtick-delimited constant stays safe; only the two repo links are interpolated.
+const DEMO_PAGE_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hybrid RAG Search — Live Demo</title>
+<style>
+:root{--fg:#1a1a1a;--muted:#666;--line:#e3e3e0;--bg:#faf9f7;--card:#fff;--accent:#8a4b2d;--lex:#2d5f8a;--sem:#6b4b8a}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+.wrap{max-width:820px;margin:0 auto;padding:2.2rem 1rem 4rem}
+h1{font-size:1.7rem;margin:0 0 .2rem;font-weight:650}
+.sub{color:var(--muted);margin:0 0 1.4rem}
+.sub a{color:var(--accent)}
+.bar{display:flex;gap:.5rem}
+input[type=search]{flex:1;padding:.65rem .9rem;font-size:1rem;border:1px solid var(--line);border-radius:10px;background:var(--card)}
+button.go{padding:.65rem 1.2rem;font-size:1rem;border:0;border-radius:10px;background:var(--accent);color:#fff;cursor:pointer}
+button.go:disabled{opacity:.5;cursor:wait}
+.chips{display:flex;flex-wrap:wrap;gap:.45rem;margin:.8rem 0 .4rem}
+.chip{padding:.28rem .75rem;font-size:.86rem;border:1px solid var(--line);border-radius:999px;background:var(--card);cursor:pointer;color:var(--fg)}
+.chip:hover{border-color:var(--accent)}
+.modes{display:flex;gap:0;margin:.9rem 0 0;border:1px solid var(--line);border-radius:10px;overflow:hidden;width:max-content}
+.modes label{padding:.4rem .95rem;font-size:.88rem;cursor:pointer;background:var(--card);border-left:1px solid var(--line)}
+.modes label:first-child{border-left:0}
+.modes input{display:none}
+.modes input:checked+span{font-weight:650;color:var(--accent)}
+.status{margin:1.1rem 0 .4rem;color:var(--muted);font-size:.9rem;min-height:1.3em}
+.res{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:.9rem 1.1rem;margin:.7rem 0}
+.res h3{margin:0 0 .3rem;font-size:1.02rem;font-weight:650}
+.badges{display:inline-flex;gap:.35rem;margin-left:.5rem;vertical-align:middle}
+.b{font-size:.7rem;padding:.1rem .5rem;border-radius:999px;color:#fff;font-weight:600}
+.b.lex{background:var(--lex)}.b.sem{background:var(--sem)}.b.src{background:#999}
+.res p{margin:.35rem 0 0;font-size:.93rem;color:#333}
+.res .meta{margin-top:.45rem;font-size:.78rem;color:var(--muted)}
+mark{background:#f5e3a3;padding:0 .1em;border-radius:3px}
+details.hood{margin:1.4rem 0;border:1px dashed var(--line);border-radius:12px;padding:.7rem 1.1rem;background:#fdfcfa}
+details.hood summary{cursor:pointer;font-weight:650;font-size:.95rem}
+.hood table{border-collapse:collapse;margin:.6rem 0 .2rem;font-size:.86rem;width:100%}
+.hood td{text-align:left;padding:.3rem .55rem;border-bottom:1px solid var(--line);vertical-align:top}
+.hood td:first-child{white-space:nowrap;color:var(--muted)}
+footer{margin-top:2.5rem;padding-top:1rem;border-top:1px solid var(--line);color:var(--muted);font-size:.86rem}
+footer a{color:var(--accent)}
+.err{background:#fbeeea;border:1px solid #e8c4b8;border-radius:10px;padding:.8rem 1rem;margin:.8rem 0;font-size:.92rem}
+</style></head>
+<body><div class="wrap">
+<h1>Hybrid RAG Search — Live Demo</h1>
+<p class="sub">Search a cached corpus of public-domain classics with a real production retrieval engine:
+SQLite FTS5 (lexical) + bge-m3 vectors in Neon pgvector (semantic), fused with weighted RRF — all on a
+single Cloudflare Worker, free tier only. <a href="${DEMO_REPO_URL}">Source</a> ·
+<a href="${DEMO_CASE_STUDY_URL}">Case study</a></p>
+<div class="bar">
+  <input id="q" type="search" placeholder="Ask the corpus… e.g. commodity fetishism" maxlength="200">
+  <button class="go" id="go">Search</button>
+</div>
+<div class="chips" id="chips"></div>
+<div class="modes" id="modes">
+  <label><input type="radio" name="m" value="hybrid" checked><span>Hybrid (RRF)</span></label>
+  <label><input type="radio" name="m" value="lexical"><span>Lexical only</span></label>
+  <label><input type="radio" name="m" value="semantic"><span>Semantic only</span></label>
+</div>
+<div class="status" id="status"></div>
+<div id="out"></div>
+<footer>Built by <a href="https://github.com/aminbm1919">Amin</a> — a ~37k-line serverless RAG backend.
+The demo is read-only and budget-capped; repeated queries are served from cache. Sample queries cost
+nothing; free-text queries are rate-limited to protect the free-plan quota.</footer>
+</div>
+<script>
+(function(){
+  var SAMPLES = ["commodity fetishism", "use value and exchange value", "history of class struggles", "alienation of labour", "the working day"];
+  var q = document.getElementById('q'), go = document.getElementById('go'),
+      out = document.getElementById('out'), status = document.getElementById('status'),
+      chips = document.getElementById('chips');
+  SAMPLES.forEach(function(s){
+    var c = document.createElement('button'); c.className = 'chip'; c.textContent = s;
+    c.onclick = function(){ q.value = s; run(); };
+    chips.appendChild(c);
+  });
+  function esc(t){ var d = document.createElement('div'); d.textContent = String(t == null ? '' : t); return d.innerHTML; }
+  function hi(text, query){
+    var safe = esc(text);
+    var terms = String(query || '').toLowerCase().split(/\\s+/).filter(function(t){ return t.length > 2; });
+    terms.forEach(function(t){
+      var escaped = t.replace(/[.*+?^{}$()|[\\]\\\\]/g, '\\\\$&');
+      try { safe = safe.replace(new RegExp('(' + escaped + ')', 'gi'), '<mark>$1</mark>'); } catch (e) {}
+    });
+    return safe;
+  }
+  function mode(){ var m = document.querySelector('#modes input:checked'); return m ? m.value : 'hybrid'; }
+  var inflight = null;
+  function run(){
+    var query = q.value.trim();
+    if (!query) return;
+    if (inflight) inflight.abort();
+    inflight = new AbortController();
+    go.disabled = true;
+    status.textContent = 'Searching…';
+    out.innerHTML = '';
+    var t0 = Date.now();
+    fetch('/demo-search?q=' + encodeURIComponent(query) + '&mode=' + mode(), { signal: inflight.signal })
+      .then(function(r){ return r.json().then(function(j){ return { s: r.status, j: j }; }); })
+      .then(function(rr){
+        go.disabled = false;
+        var d = rr.j;
+        if (rr.s === 429) { status.textContent = ''; out.innerHTML = '<div class="err">' + esc(d.error || 'Demo quota reached — try a sample query (cached) or come back later.') + '</div>'; return; }
+        if (!d.ok) { status.textContent = ''; out.innerHTML = '<div class="err">' + esc(d.error || 'Something went wrong.') + '</div>'; return; }
+        var took = Date.now() - t0;
+        status.textContent = d.result_count + ' results · ' + took + ' ms round-trip' + (d.cached ? ' · served from response cache' : '');
+        var html = '';
+        (d.results || []).forEach(function(r){
+          var badges = '';
+          (r.matched_by || []).forEach(function(b){
+            if (b === 'lexical') badges += '<span class="b lex">lexical' + (r.lexical_rank ? ' #' + r.lexical_rank : '') + '</span>';
+            if (b === 'semantic') badges += '<span class="b sem">semantic' + (r.semantic_rank ? ' #' + r.semantic_rank : '') + '</span>';
+          });
+          if (r.source) badges += '<span class="b src">' + esc(r.source) + '</span>';
+          var meta = [];
+          if (r.rrf_score) meta.push('RRF ' + r.rrf_score);
+          if (r.semantic_similarity) meta.push('cosine ' + r.semantic_similarity);
+          html += '<div class="res"><h3>' + r.rank + '. ' + esc(r.title) + '<span class="badges">' + badges + '</span></h3>'
+            + '<p>' + hi(r.snippet, d.query) + '</p>'
+            + (meta.length ? '<div class="meta">' + esc(meta.join(' · ')) + '</div>' : '')
+            + '</div>';
+        });
+        if (!html) html = '<div class="err">No results for this query in the demo corpus — try one of the samples.</div>';
+        var p = d.pipeline || {}, t = d.timings || {};
+        var rows = '';
+        if (p.lexical && p.lexical.ran) rows += '<tr><td>Lexical branch</td><td>' + esc(p.lexical.engine) + ' — ' + p.lexical.count + ' hits' + (t.lexical_ms != null ? ' · ' + t.lexical_ms + ' ms' : '') + '</td></tr>';
+        if (p.semantic && p.semantic.ran) rows += '<tr><td>Semantic branch</td><td>' + esc(p.semantic.engine) + ' — ' + p.semantic.count + ' hits · embed: ' + esc(p.semantic.embed_provider || '?') + (p.semantic.embed_cached ? ' (vector cache hit)' : '') + (t.embed_ms != null ? ' · embed ' + t.embed_ms + ' ms' : '') + (t.vector_ms != null ? ' · probe ' + t.vector_ms + ' ms' : '') + '</td></tr>';
+        if (p.semantic && p.semantic.note) rows += '<tr><td>Note</td><td>' + esc(p.semantic.note) + '</td></tr>';
+        if (p.fusion) rows += '<tr><td>Fusion</td><td>' + esc(p.fusion.method) + ' — k=' + p.fusion.k + ', weights lexical ' + p.fusion.weights.lexical + ' / semantic ' + p.fusion.weights.semantic + '</td></tr>';
+        rows += '<tr><td>Corpus</td><td>' + esc(d.corpus || '') + '</td></tr>';
+        html += '<details class="hood"><summary>Under the hood</summary><table>' + rows + '</table></details>';
+        out.innerHTML = html;
+      })
+      .catch(function(e){
+        if (e && e.name === 'AbortError') return;
+        go.disabled = false; status.textContent = '';
+        out.innerHTML = '<div class="err">Network error — please retry.</div>';
+      });
+  }
+  go.onclick = run;
+  q.addEventListener('keydown', function(e){ if (e.key === 'Enter') run(); });
+})();
+</script></body></html>`;
+
+/** GEAR (demo): plain JSON responder — deliberately BYPASSES attachPhaseZeroObservability. The demo is a
+ * public portfolio API: no gpt_guide decoration, and no wire-contract telemetry stripping (which would
+ * silently drop demo fields like semantic_rank). */
+function demoJson(data, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, OPTIONS"
+    }
+  });
+}
+
+/** GEAR (demo): lazily create the three demo tables in central D1; memoized per isolate. */
+let demoTablesEnsured = false;
+async function ensureDemoTables(env) {
+  if (demoTablesEnsured) return;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS demo_rate_buckets (bucket TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0, updated_at TEXT)").run();
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS demo_query_vectors (query_hash TEXT PRIMARY KEY, query_text TEXT, vector_json TEXT, provider TEXT, created_at TEXT)").run();
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS demo_response_cache (cache_key TEXT PRIMARY KEY, mode TEXT, query_text TEXT, response_json TEXT, created_at TEXT, hits INTEGER DEFAULT 0)").run();
+  demoTablesEnsured = true;
+}
+
+/**
+ * MACHINE (demo doorman): per-IP hourly + global daily budget, D1-bucket counters.
+ * INPUT: request (CF-Connecting-IP). OUTPUT: {ok} or {ok:false, scope, cap}. Caps from storage_policy
+ * demo_ip_per_hour (default 10) / demo_global_per_day (default 300). Buckets are hour/day-keyed rows;
+ * stale buckets are pruned opportunistically (~1 in 25 calls).
+ */
+async function demoBudgetCheck(env, request) {
+  const now = new Date();
+  const iso = now.toISOString();
+  const ipHash = simpleHash(String(request.headers.get("CF-Connecting-IP") || "unknown"));
+  const ipBucket = "ip:" + ipHash + ":" + iso.slice(0, 13);
+  const dayBucket = "global:" + iso.slice(0, 10);
+  const ipCap = await getStoragePolicyInt(env, "demo_ip_per_hour", 10, 1, 1000);
+  const globalCap = await getStoragePolicyInt(env, "demo_global_per_day", 300, 1, 100000);
+  const bump = async bucket => {
+    const row = await env.DB.prepare(
+      "INSERT INTO demo_rate_buckets (bucket, count, updated_at) VALUES (?, 1, ?) " +
+      "ON CONFLICT(bucket) DO UPDATE SET count = count + 1, updated_at = excluded.updated_at RETURNING count"
+    ).bind(bucket, iso).first();
+    return Number(row && row.count || 0);
+  };
+  const ipCount = await bump(ipBucket);
+  if (ipCount > ipCap) return { ok: false, scope: "ip_hourly", cap: ipCap };
+  const dayCount = await bump(dayBucket);
+  if (dayCount > globalCap) return { ok: false, scope: "global_daily", cap: globalCap };
+  if (Math.random() < 0.04) {
+    const cutoff = new Date(now.getTime() - 48 * 3600 * 1000).toISOString();
+    await env.DB.prepare("DELETE FROM demo_rate_buckets WHERE updated_at < ?").bind(cutoff).run().catch(() => null);
+  }
+  return { ok: true };
+}
+
+/**
+ * MACHINE (demo embedder): canonical-query vector with D1 cache; NVIDIA -> HF fallback; NEVER Workers AI.
+ * INPUT: query. OUTPUT: {ok, vector, provider, cached, ms} or {ok:false, error, ms}.
+ */
+async function demoGetQueryVector(env, query) {
+  const started = Date.now();
+  const norm = normalizeWhitespace(String(query || "").toLowerCase());
+  const qHash = simpleHash(norm) + ":" + norm.length;
+  const cachedRow = await env.DB.prepare("SELECT vector_json, provider FROM demo_query_vectors WHERE query_hash = ? LIMIT 1").bind(qHash).first().catch(() => null);
+  if (cachedRow && cachedRow.vector_json) {
+    try {
+      const vector = JSON.parse(cachedRow.vector_json);
+      if (Array.isArray(vector) && vector.length === QDRANT_EMBED_DIM) {
+        return { ok: true, vector, provider: String(cachedRow.provider || "cache"), cached: true, ms: Date.now() - started };
+      }
+    } catch (_) {}
+  }
+  let vector = null, provider = null, lastError = null;
+  // NVIDIA first (fail-FAST, no retries — its embeddings endpoint has a known 5xx history and the demo
+  // must stay snappy), then HF (same bge-m3 weights => same 1024-dim space as the stored corpus).
+  try { vector = await embedTextWithNvidiaBgeM3(env, norm, 0); provider = "nvidia_bge_m3"; }
+  catch (nvErr) {
+    lastError = nvErr;
+    try { vector = await embedTextWithHfBgeM3(env, norm); provider = "hf_bge_m3"; }
+    catch (hfErr) { lastError = hfErr; }
+  }
+  if (!Array.isArray(vector)) {
+    return { ok: false, error: String(lastError && (lastError.message || lastError) || "embed_failed"), ms: Date.now() - started };
+  }
+  await env.DB.prepare("INSERT OR REPLACE INTO demo_query_vectors (query_hash, query_text, vector_json, provider, created_at) VALUES (?, ?, ?, ?, ?)")
+    .bind(qHash, norm, JSON.stringify(vector), provider, new Date().toISOString()).run().catch(() => null);
+  return { ok: true, vector, provider, cached: false, ms: Date.now() - started };
+}
+
+/** GEAR (demo): the fixed Neon probe set when demo_neon_projects is unset — every topic's PRIMARY project. */
+function demoDefaultNeonPrimaries() {
+  const keys = [];
+  for (const t of Object.keys(NEON_TOPIC_PROJECTS)) {
+    const pair = NEON_TOPIC_PROJECTS[Number(t)];
+    if (pair && pair[0] && !keys.includes(pair[0])) keys.push(pair[0]);
+  }
+  return keys.slice(0, 5);
+}
+
+/** GEAR (demo): whitelisted owner scope = ready registry docs from public-domain sources; memoized 10 min. */
+let demoOwnerScopeMemo = { at: 0, keys: null };
+async function demoOwnerScope(env) {
+  if (demoOwnerScopeMemo.keys && (Date.now() - demoOwnerScopeMemo.at) < 10 * 60 * 1000) return demoOwnerScopeMemo.keys;
+  const rows = await env.DB.prepare(
+    "SELECT cache_key FROM document_cache_registry WHERE source IN ('marxists','gutenberg','wikisource') AND cache_status = 'ready' LIMIT 400"
+  ).all().catch(() => null);
+  const keys = ((rows && rows.results) || []).map(r => String(r.cache_key)).filter(Boolean);
+  demoOwnerScopeMemo = { at: Date.now(), keys };
+  return keys;
+}
+
+/**
+ * MACHINE (demo semantic branch): pre-seed the hybrid context with the NVIDIA/HF vector (so
+ * getOrEmbedHybridQuery never reaches Workers AI), then run the standard m3 vector branch with a
+ * FIXED Neon project list (no CF-llama router) and the demo owner-key scope.
+ */
+async function demoSemanticBranch(env, query, vector, topK) {
+  const policy = await resolveVectorQueryIndexPolicy(env, { index_key: "m3_cache" });
+  if (!policy.ok) return { ok: false, status: policy.status || "policy_failed", results: [] };
+  const context = makeHybridQueryContext();
+  const memoKey = String(policy.index_key || policy.vector_index_name || "unknown") + "::" + simpleHash(query || "");
+  context.embeddings.set(memoKey, { ok: true, vector, response_shape: { type: "demo_preembedded" } });
+  const configured = String(await getStoragePolicyValue(env, "demo_neon_projects", "") || "")
+    .split(",").map(s => s.trim()).filter(Boolean);
+  const ownerKeys = await demoOwnerScope(env);
+  return runHybridVectorBranchForIndex(env, query, "m3_cache", [], {
+    allowed_owner_keys: ownerKeys,
+    top_k_vector: topK,
+    originRoute: "demo_search_semantic",
+    originRealm: "demo",
+    demo_fixed_neon_projects: configured.length ? configured : demoDefaultNeonPrimaries()
+  }, context);
+}
+
+/** GEAR (demo): stable dedup key for fusion — owner doc + chunk/segment position, else snippet hash. */
+function demoResultKey(item) {
+  const owner = String(item.document_cache_key || item.cache_key || item.owner_key || item.parent_document_key || item.title || "");
+  const pos = item.chunk_index ?? item.source_chunk_index ?? item.segment_index ?? null;
+  if (pos !== null && pos !== undefined) return owner + "::" + String(pos);
+  return owner + "::" + simpleHash(String(item.snippet || item.preview || item.excerpt || item.chunk_text || "").slice(0, 200));
+}
+
+/** GEAR (demo): weighted Reciprocal Rank Fusion (k=60; lexical 1.20 / semantic 1.25 — production weights). */
+function demoRrfFuse(lexResults, semResults, k = 60) {
+  const items = new Map();
+  const add = (list, branch, weight) => {
+    (list || []).forEach((item, idx) => {
+      const key = demoResultKey(item);
+      const entry = items.get(key) || { item, branches: {}, score: 0 };
+      if (!(branch in entry.branches)) {
+        entry.branches[branch] = idx + 1;
+        entry.score += weight / (k + idx + 1);
+      }
+      if (branch === "lexical" && entry.item !== item && !(entry.item.snippet || entry.item.preview)) entry.item = item;
+      items.set(key, entry);
+    });
+  };
+  add(lexResults, "lexical", 1.20);
+  add(semResults, "semantic", 1.25);
+  return Array.from(items.values()).sort((a, b) => b.score - a.score);
+}
+
+/** GEAR (demo): prettify a path-looking title ("archive/rubin/abstract-labour.htm" -> "Abstract Labour"). */
+function demoPrettifyTitle(raw) {
+  const title = String(raw || "").trim();
+  if (!title) return "Untitled";
+  if (!/[\/\\]/.test(title) || /\s/.test(title)) return title;
+  const base = title.split(/[\/\\]/).filter(Boolean).pop() || title;
+  const words = base.replace(/\.(html?|txt|pdf)$/i, "").replace(/[-_]+/g, " ").trim();
+  if (!words) return title;
+  return words.replace(/\b\w/g, ch => ch.toUpperCase());
+}
+
+/** GEAR (demo): project an internal candidate to the small public demo shape (defensive field fallbacks). */
+function demoProjectResult(entry, rank) {
+  const item = entry.item || {};
+  const snippet = String(item.snippet || item.preview || item.excerpt || item.text_preview || item.chunk_preview || item.segment_text || item.chunk_text || "").replace(/\s+/g, " ").trim();
+  const out = {
+    rank,
+    title: demoPrettifyTitle(item.title || item.display_title || item.document_title).slice(0, 160),
+    source: String(item.source || item.source_family || ""),
+    snippet: snippet.slice(0, 400),
+    matched_by: Object.keys(entry.branches || {}),
+    lexical_rank: (entry.branches && entry.branches.lexical) || null,
+    semantic_rank: (entry.branches && entry.branches.semantic) || null
+  };
+  if (entry.score) out.rrf_score = Number(entry.score.toFixed(5));
+  const sim = Number(item.semantic_score || 0);
+  if (sim > 0) out.semantic_similarity = Number(sim.toFixed(4));
+  return out;
+}
+
+/**
+ * MACHINE (demo search): flag check -> response cache (free) -> budget -> lexical (FTS, vector off)
+ * and/or semantic (NVIDIA/HF embed + fixed-project Neon probe) -> optional RRF -> project + cache.
+ * Modes: hybrid (default) | lexical | semantic.
+ */
+async function handleDemoSearch(url, env, request) {
+  const enabled = await isStoragePolicyEnabled(env, "demo_enabled", false);
+  if (!enabled) return demoJson({ ok: false, demo: true, error: "The public demo is currently disabled.", error_code: "demo_disabled" }, 404);
+  await ensureDemoTables(env);
+  const query = normalizeWhitespace(String(firstParam(url, ["q", "query"]) || "")).slice(0, 200).trim();
+  if (!query) return demoJson({ ok: false, demo: true, error: "q is required (?q=your+question).", error_code: "missing_required_parameter" }, 400);
+  let mode = String(url.searchParams.get("mode") || "hybrid").toLowerCase();
+  if (!["lexical", "semantic", "hybrid"].includes(mode)) mode = "hybrid";
+
+  const cacheKey = mode + ":" + simpleHash(query.toLowerCase()) + ":" + query.length;
+  const cachedRow = await env.DB.prepare("SELECT response_json FROM demo_response_cache WHERE cache_key = ? LIMIT 1").bind(cacheKey).first().catch(() => null);
+  if (cachedRow && cachedRow.response_json) {
+    try {
+      const parsed = JSON.parse(cachedRow.response_json);
+      parsed.cached = true;
+      await env.DB.prepare("UPDATE demo_response_cache SET hits = hits + 1 WHERE cache_key = ?").bind(cacheKey).run().catch(() => null);
+      return demoJson(parsed);
+    } catch (_) {}
+  }
+
+  const budget = await demoBudgetCheck(env, request);
+  if (!budget.ok) {
+    return demoJson({
+      ok: false, demo: true, error_code: "demo_budget_exhausted", scope: budget.scope,
+      error: "The demo quota is used up for now (" + budget.scope + "). The sample queries still work — they are served from cache. Full source: " + DEMO_REPO_URL
+    }, 429);
+  }
+
+  const timings = {};
+  let lex = null, sem = null, embedInfo = null;
+  if (mode !== "semantic") {
+    const t0 = Date.now();
+    lex = await searchDocumentTextCache(env, query, {
+      sources: DEMO_SOURCES,
+      maxResults: 12,
+      includeDocumentCache: true,
+      includeScoredCache: true,
+      vectorMode: "off",
+      originRoute: "demo_search_lexical"
+    });
+    timings.lexical_ms = Date.now() - t0;
+  }
+  if (mode !== "lexical") {
+    embedInfo = await demoGetQueryVector(env, query);
+    timings.embed_ms = embedInfo.ms;
+    if (embedInfo.ok) {
+      const t1 = Date.now();
+      sem = await demoSemanticBranch(env, query, embedInfo.vector, 10);
+      timings.vector_ms = Date.now() - t1;
+    }
+  }
+
+  const lexResults = (lex && lex.results) || [];
+  const semResults = (sem && sem.results) || [];
+  let projected;
+  if (mode === "hybrid") {
+    projected = demoRrfFuse(lexResults, semResults).slice(0, 10).map((entry, i) => demoProjectResult(entry, i + 1));
+  } else {
+    const single = mode === "lexical" ? lexResults : semResults;
+    projected = single.slice(0, 10).map((item, i) => demoProjectResult({ item, branches: { [mode]: i + 1 }, score: 0 }, i + 1));
+  }
+
+  const out = {
+    ok: true, demo: true, mode, query,
+    result_count: projected.length,
+    results: projected,
+    pipeline: {
+      lexical: mode !== "semantic"
+        ? { ran: true, count: lexResults.length, engine: "SQLite FTS5 across 9 D1 shards (contentless index, bodies in R2)" }
+        : { ran: false },
+      semantic: mode !== "lexical"
+        ? {
+            ran: !!(embedInfo && embedInfo.ok), count: semResults.length,
+            engine: "bge-m3 1024-dim -> Neon pgvector halfvec HNSW (topic-sharded projects)",
+            embed_provider: (embedInfo && embedInfo.ok) ? embedInfo.provider : null,
+            embed_cached: (embedInfo && embedInfo.ok) ? embedInfo.cached : null,
+            note: (embedInfo && !embedInfo.ok) ? "semantic branch unavailable (embedding providers unreachable) — showing lexical results only" : undefined
+          }
+        : { ran: false },
+      fusion: mode === "hybrid" ? { method: "weighted Reciprocal Rank Fusion", k: 60, weights: { lexical: 1.2, semantic: 1.25 } } : null
+    },
+    timings,
+    corpus: "public-domain classics cached from marxists.org / Project Gutenberg / Wikisource",
+    links: { repo: DEMO_REPO_URL, case_study: DEMO_CASE_STUDY_URL },
+    cached: false
+  };
+  if (projected.length) {
+    await env.DB.prepare("INSERT OR REPLACE INTO demo_response_cache (cache_key, mode, query_text, response_json, created_at, hits) VALUES (?, ?, ?, ?, ?, 0)")
+      .bind(cacheKey, mode, query, JSON.stringify(out), new Date().toISOString()).run().catch(() => null);
+  }
+  return demoJson(out);
+}
+
+/** MACHINE (demo front door): routes /demo (HTML page) and /demo-search (JSON API); both behind demo_enabled. */
+async function handleDemoRoutes(route, request, url, env) {
+  if (route === "/demo-search") return handleDemoSearch(url, env, request);
+  const enabled = await isStoragePolicyEnabled(env, "demo_enabled", false);
+  if (!enabled) return new Response("The demo is currently disabled.", { status: 404, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+  return new Response(DEMO_PAGE_HTML, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=300" } });
+}
+
+// END_OF_WORKER_V2_9_40_C_6_HP_ROUTINE_PERIMETER_TOKEN_GATE_ALL_ROUTES_DARK_UNTIL_ROUTINE_TOKEN_SECRET_SET_X_ROUTINE_TOKEN_HEADER_OR_QUERY_CONSTANT_TIME_ADMIN_TOKEN_ALSO_PASSES_401_WITH_REMEDY
+
+// END_OF_WORKER_V2_9_40_C_6_HQ_PUBLIC_PORTFOLIO_DEMO_ROUTES_DEMO_AND_DEMO_SEARCH_PERIMETER_EXEMPT_FLAG_DEMO_ENABLED_DEFAULT_OFF_D1_BUDGET_GUARD_IP_HOURLY_GLOBAL_DAILY_NVIDIA_HF_QUERY_EMBED_NO_WORKERS_AI_FIXED_NEON_PROJECTS_NO_LLAMA_ROUTER_QUERY_VECTOR_AND_RESPONSE_CACHES_WEIGHTED_RRF_K60

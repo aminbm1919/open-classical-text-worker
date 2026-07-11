@@ -6,6 +6,8 @@ The worker discovers, caches, indexes, and retrieves primary-source texts from s
 
 ~36,700 lines · ~716 functions · 15 subsystems · 52 API operations · 4 cron maintenance jobs
 
+**→ Try it live: [chunking.aminbm1919.workers.dev/demo](https://chunking.aminbm1919.workers.dev/demo)** — search the corpus yourself and flip between *lexical / semantic / hybrid (RRF)* retrieval.
+
 **→ Read the case study: [Engineering a Production RAG Backend on $0/month](docs/CASE_STUDY.md)**
 
 ---

@@ -2,6 +2,8 @@
 
 *How a philosophy-research Custom GPT got real retrieval, real citations, and real memory — on the Cloudflare Workers free plan.*
 
+**Try the retrieval engine yourself: [live demo](https://chunking.aminbm1919.workers.dev/demo)** — a budget-capped, read-only showcase with a lexical / semantic / hybrid switch, running on this exact worker.
+
 ---
 
 ## The problem

@@ -14,7 +14,7 @@ wire-check — پاسبانِ قراردادِ لاغرِ wire (مرجع: WIRE_C
 """
 import os, json, sys, urllib.request, urllib.parse
 
-BASE = os.environ.get("WORKER_BASE_URL", "https://chunking.YOUR-SUBDOMAIN.workers.dev")
+BASE = "https://chunking.YOUR-SUBDOMAIN.workers.dev"
 
 # کلیدهای همیشه-مجازِ سراسری (دکوراتورِ phase-zero)
 GLOBAL_OK = {
@@ -105,7 +105,7 @@ MUST_BE_GONE = {
 def fetch(url, tries=3):
     last = None
     for _ in range(tries):
-        req = urllib.request.Request(BASE + url, headers={"User-Agent": "wire-check"})
+        req = urllib.request.Request(BASE + url, headers={"User-Agent": "wire-check", "X-Routine-Token": os.environ.get("ROUTINE_TOKEN", "")})
         try:
             with urllib.request.urlopen(req, timeout=90) as r:
                 return json.loads(r.read().decode("utf-8"))

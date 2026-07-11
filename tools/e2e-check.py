@@ -9,9 +9,9 @@ e2e-check — تستِ رگرسیونِ عملکردهای اساسیِ وورک
 توجه: read-chunk و parse رویدادِ خواندنِ واقعی می‌سازند (رفتارِ عادی)؛ تستِ score فقط مسیرِ reject(-1) را می‌زند
 تا scored_cache آلوده نشود؛ حافظهٔ تستی در انتها حذف می‌شود.
 """
-import json, sys, time, urllib.request, urllib.error, urllib.parse
+import os, json, sys, time, urllib.request, urllib.error, urllib.parse
 
-BASE = os.environ.get("WORKER_BASE_URL", "https://chunking.YOUR-SUBDOMAIN.workers.dev")
+BASE = "https://chunking.YOUR-SUBDOMAIN.workers.dev"
 FAILS = []
 
 def call(path, method="GET", body=None, timeout=120, tries=2):
@@ -20,7 +20,7 @@ def call(path, method="GET", body=None, timeout=120, tries=2):
         try:
             data = json.dumps(body).encode() if body is not None else None
             req = urllib.request.Request(BASE + path, data=data, method=method,
-                                         headers={"User-Agent": "e2e-check", "Content-Type": "application/json"})
+                                         headers={"User-Agent": "e2e-check", "Content-Type": "application/json", "X-Routine-Token": os.environ.get("ROUTINE_TOKEN", "")})
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as r:
                     return r.status, json.loads(r.read().decode("utf-8"))
