@@ -6,6 +6,8 @@ The worker discovers, caches, indexes, and retrieves primary-source texts from s
 
 ~36,700 lines · ~716 functions · 15 subsystems · 52 API operations · 4 cron maintenance jobs
 
+**→ Read the case study: [Engineering a Production RAG Backend on $0/month](docs/CASE_STUDY.md)**
+
 ---
 
 ## Why this project is interesting
