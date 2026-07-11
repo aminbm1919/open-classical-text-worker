@@ -14,6 +14,11 @@ Most RAG stacks assume a beefy backend and a paid vector database. This one runs
 
 ## Architecture at a glance
 
+![Architecture diagram](docs/assets/architecture.svg)
+
+<details>
+<summary>Diagram source (mermaid)</summary>
+
 ```mermaid
 flowchart LR
     GPT[Custom GPT] -->|OpenAPI action 22 ops| W[Cloudflare Worker]
@@ -26,6 +31,8 @@ flowchart LR
     W -->|embed: Workers AI| QD[(Qdrant<br/>GPT memory vectors, int8)]
     CRON[4 cron jobs] --> W
 ```
+
+</details>
 
 **Two entry points.** `fetch` serves the GPT's two OpenAPI actions (a routine research action and a token-guarded admin action — ChatGPT caps each action at 30 operations, so a thin proxy worker provides the second hostname). `scheduled` runs four lock-aware maintenance jobs: seasonal source reindexing, memory-vector microtasks, vector-capacity management, and daily cache pruning.
 

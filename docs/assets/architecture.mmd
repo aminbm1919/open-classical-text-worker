@@ -1,0 +1,10 @@
+flowchart LR
+    GPT[Custom GPT] -->|OpenAPI action 22 ops| W[Cloudflare Worker]
+    GPT -->|admin action 30 ops, token| P[Proxy worker] --> W
+    W -->|discover / parse| SRC[6 source adapters<br/>marxists · gutenberg · wikisource<br/>jstor · core · arxiv]
+    W --> D1[(Central D1<br/>registry · sessions · scoring · memory)]
+    W --> SH[(9 D1 text shards<br/>documents · chunks · FTS5)]
+    W --> R2[(R2<br/>full-text bodies)]
+    W -->|embed: NVIDIA bge-m3| NEON[(Neon pgvector<br/>corpus vectors, halfvec,<br/>10 topic-sharded projects)]
+    W -->|embed: Workers AI| QD[(Qdrant<br/>GPT memory vectors, int8)]
+    CRON[4 cron jobs] --> W
