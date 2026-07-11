@@ -1,0 +1,93 @@
+# wrangler.example.toml — Open Classical Text Worker
+# Copy to wrangler.toml and fill in your own account/database IDs.
+# Secrets are NOT stored here — set them with `wrangler secret put <NAME>`:
+#   ADMIN_TOKEN, MEMORY_WRITE_TOKEN, JINA_API_KEY, EXA_API_KEY,
+#   NVIDIA_API_KEY, QDRANT_API_KEY, QDRANT_URL, CORE_API_KEY
+
+name = "chunking"
+main = "worker.js"
+compatibility_date = "2026-05-29"
+account_id = "YOUR-ACCOUNT-ID"
+
+[observability]
+enabled = true
+
+# ---------- Workers AI (embeddings: bge-m3 / bge-large-en) ----------
+[ai]
+binding = "AI"
+
+# ---------- Central D1 (catalog, registry, sessions, memory, scoring, vector metadata) ----------
+[[d1_databases]]
+binding = "DB"
+database_name = "classical_text_index"
+database_id = "YOUR-D1-ID"
+
+# ---------- 9 text shards (single-copy document/chunk storage) ----------
+[[d1_databases]]
+binding = "DB_TEXT_01"
+database_name = "classical_text_shard_01"
+database_id = "YOUR-D1-ID"
+
+[[d1_databases]]
+binding = "DB_TEXT_02"
+database_name = "classical_text_shard_02"
+database_id = "YOUR-D1-ID"
+
+[[d1_databases]]
+binding = "DB_TEXT_03"
+database_name = "classical_text_shard_03"
+database_id = "YOUR-D1-ID"
+
+[[d1_databases]]
+binding = "DB_TEXT_04"
+database_name = "classical_text_shard_04"
+database_id = "YOUR-D1-ID"
+
+[[d1_databases]]
+binding = "DB_TEXT_05"
+database_name = "classical_text_shard_05"
+database_id = "YOUR-D1-ID"
+
+[[d1_databases]]
+binding = "DB_TEXT_06"
+database_name = "classical_text_shard_06"
+database_id = "YOUR-D1-ID"
+
+[[d1_databases]]
+binding = "DB_TEXT_07"
+database_name = "classical_text_shard_07"
+database_id = "YOUR-D1-ID"
+
+[[d1_databases]]
+binding = "DB_TEXT_08"
+database_name = "classical_text_shard_08"
+database_id = "YOUR-D1-ID"
+
+[[d1_databases]]
+binding = "DB_TEXT_09"
+database_name = "classical_text_shard_09"
+database_id = "YOUR-D1-ID"
+
+# ---------- Vectorize indexes (1024-dim, cosine) ----------
+[[vectorize]]
+binding = "VECTORIZE_M3_CACHE"
+index_name = "m3-cache"
+
+[[vectorize]]
+binding = "VECTORIZE_BGE_LARGE_SCORED_EN"
+index_name = "bge-large-scored-en"
+
+# ---------- R2 (document-text offload + ingestion inbox) ----------
+[[r2_buckets]]
+binding = "TEXT_R2"
+bucket_name = "classical-text-store"
+
+# ---------- Cron triggers (must stay byte-identical to the strings the code matches) ----------
+[triggers]
+crons = ["0 0 L */3 *", "*/10 * * * *", "17 */8 * * *", "33 2 * * *", "0 6 */3 * *"]
+
+# ---------- Plain vars (JSTOR human-rate limits — match the code defaults) ----------
+[vars]
+JSTOR_MAX_PER_10_MIN = "2"
+JSTOR_MAX_PER_HOUR = "4"
+JSTOR_MAX_PER_DAY = "10"

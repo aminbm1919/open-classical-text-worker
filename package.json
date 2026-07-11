@@ -1,0 +1,17 @@
+{
+  "name": "chunking-worker",
+  "version": "2.9.40-c6",
+  "private": true,
+  "type": "module",
+  "description": "Open Classical Text Worker (Cloudflare). Single-file worker.js; build step added only to bundle the Neon serverless driver for the corpus-vector phase.",
+  "main": "worker.js",
+  "scripts": {
+    "deploy": "wrangler deploy --keep-vars"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^0.10.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

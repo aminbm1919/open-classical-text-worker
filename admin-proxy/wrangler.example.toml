@@ -1,0 +1,14 @@
+# chunking-admin — proxy worker that gives the GPT admin Action its own hostname.
+# It forwards every request to the main `chunking` worker via a Service Binding.
+# Copy to wrangler.toml, fill in your account_id, then:
+#   wrangler deploy -c admin-proxy/wrangler.toml
+name = "chunking-admin"
+main = "proxy.js"
+compatibility_date = "2026-05-29"
+account_id = "YOUR-ACCOUNT-ID"
+
+# Direct worker-to-worker binding to the main worker (same account). No public
+# round-trip, no extra bindings needed here — the main worker owns all resources.
+[[services]]
+binding = "MAIN"
+service = "chunking"
